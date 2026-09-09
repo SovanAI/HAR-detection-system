@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 
 import cv2
@@ -110,6 +111,7 @@ def main():
     )
 
     boxes = []
+    confidences = []
 
     for result in results:
 
@@ -128,6 +130,7 @@ def main():
             xyxy = box.xyxy[0].cpu().numpy()
 
             boxes.append(xyxy)
+            confidences.append(confidence)
 
             print(
                 f"    Person | "
@@ -144,7 +147,14 @@ def main():
         dtype=np.float32
     )
 
-    print(f"\n[6] Persons detected: {len(boxes)}")
+    confidences = np.asarray(
+        confidences,
+        dtype=np.float32
+    )
+
+    print(
+        f"\n[6] Persons detected: {len(boxes)}"
+    )
 
     # -----------------------------------------------------
     # Load HMR2
@@ -230,7 +240,7 @@ def main():
             )
 
     # -----------------------------------------------------
-    # Combine
+    # Combine HMR2 results
     # -----------------------------------------------------
 
     joints = np.concatenate(
@@ -249,13 +259,17 @@ def main():
     )
 
     # -----------------------------------------------------
-    # Save
+    # Create output directory
     # -----------------------------------------------------
 
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
+
+    # -----------------------------------------------------
+    # Save NPZ
+    # -----------------------------------------------------
 
     output_file = (
         OUTPUT_DIR / "hmr2_result.npz"
@@ -264,13 +278,135 @@ def main():
     np.savez(
         output_file,
         boxes=boxes,
+        confidences=confidences,
         joints_3d=joints,
         vertices=vertices,
         camera_translation=camera
     )
 
     # -----------------------------------------------------
-    # Summary
+    # Create JSON
+    # -----------------------------------------------------
+
+    json_data = {
+
+        "system": {
+            "name": "BAS Human 3D Pose Pipeline",
+            "device": "cpu",
+            "person_detector": "YOLO11n",
+            "pose_estimator": "HMR2"
+        },
+
+        "image": {
+            "filename": image_path.name,
+            "width": int(img_cv2.shape[1]),
+            "height": int(img_cv2.shape[0]),
+            "channels": int(img_cv2.shape[2])
+        },
+
+        "persons": []
+    }
+
+    # -----------------------------------------------------
+    # Convert each person's data to JSON
+    # -----------------------------------------------------
+
+    for person_id in range(len(boxes)):
+
+        x1, y1, x2, y2 = boxes[person_id]
+
+        person_data = {
+
+            "person_id": person_id,
+
+            "detection": {
+
+                "confidence": float(
+                    confidences[person_id]
+                ),
+
+                "bbox": {
+
+                    "x1": float(x1),
+                    "y1": float(y1),
+                    "x2": float(x2),
+                    "y2": float(y2)
+                }
+            },
+
+            "camera_translation": {
+
+                "x": float(
+                    camera[person_id][0]
+                ),
+
+                "y": float(
+                    camera[person_id][1]
+                ),
+
+                "z": float(
+                    camera[person_id][2]
+                )
+            },
+
+            "pose": {
+
+                "joint_count": int(
+                    joints.shape[1]
+                ),
+
+                "joints_3d": []
+            }
+        }
+
+        # -------------------------------------------------
+        # Add all 44 joints
+        # -------------------------------------------------
+
+        for joint_id in range(
+            joints.shape[1]
+        ):
+
+            joint = (
+                joints[person_id][joint_id]
+            )
+
+            person_data["pose"]["joints_3d"].append({
+
+                "joint_id": joint_id,
+
+                "x": float(joint[0]),
+
+                "y": float(joint[1]),
+
+                "z": float(joint[2])
+            })
+
+        json_data["persons"].append(
+            person_data
+        )
+
+    # -----------------------------------------------------
+    # Save JSON
+    # -----------------------------------------------------
+
+    json_output_file = (
+        OUTPUT_DIR / "hmr2_result.json"
+    )
+
+    with open(
+        json_output_file,
+        "w"
+    ) as f:
+
+        json.dump(
+            json_data,
+            f,
+            indent=2
+        )
+
+    # -----------------------------------------------------
+    # Final summary
     # -----------------------------------------------------
 
     print("\n" + "=" * 60)
@@ -282,9 +418,16 @@ def main():
     print(f"SMPL vertices : {vertices.shape}")
     print(f"Camera        : {camera.shape}")
 
-    print(f"\nSaved:")
+    print("\nSaved NPZ:")
     print(output_file)
 
+    print("\nSaved JSON:")
+    print(json_output_file)
+
+
+# ---------------------------------------------------------
+# Run program
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     main()
