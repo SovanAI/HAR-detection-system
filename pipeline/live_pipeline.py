@@ -2,8 +2,10 @@ import os
 import sys
 import time
 import json
-import cv2
+import threading
+import queue
 
+import numpy as np
 
 # ============================================================
 # PROJECT ROOT
@@ -12,7 +14,7 @@ import cv2
 PROJECT_ROOT = os.path.abspath(
     os.path.join(
         os.path.dirname(__file__),
-        ".."
+        "..",
     )
 )
 
@@ -24,8 +26,8 @@ if PROJECT_ROOT not in sys.path:
 # IMPORTS
 # ============================================================
 
-from ultralytics import YOLO
-
+from pipeline.camera_worker import CameraWorker
+from yolo.yolo_processor import YOLOProcessor
 from hmr.hmr_processor import HMRProcessor
 from fusion.synchronizer import FrameSynchronizer
 
@@ -38,10 +40,8 @@ CAMERA = "/dev/video0"
 
 YOLO_MODEL = os.path.join(
     PROJECT_ROOT,
-    "yolo11n.pt"
+    "yolo11n.pt",
 )
-
-HMR_INTERVAL = 10
 
 YOLO_CONFIDENCE = 0.30
 
@@ -49,524 +49,604 @@ MAX_SYNC_TIME = 0.050
 
 OUTPUT_DIR = os.path.join(
     PROJECT_ROOT,
-    "output"
+    "output",
 )
 
+# Save every synchronized frame as JSON.
+SAVE_FUSED_JSON = True
+
 
 # ============================================================
-# LIVE PIPELINE
+# LATEST FRAME SLOT
 # ============================================================
 
-def main():
+class LatestHMRQueue:
+    """
+    Keeps only the newest frame waiting for HMR.
 
-    print()
-    print("=" * 70)
-    print("              BAS LIVE PERCEPTION PIPELINE")
-    print("=" * 70)
-    print()
+    HMR is extremely slow on CPU, so we never allow
+    old frames to accumulate.
+    """
 
-    # --------------------------------------------------------
-    # Create output directory
-    # --------------------------------------------------------
+    def __init__(self):
+        self._item = None
+        self._lock = threading.Lock()
 
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
-    )
+    def put_latest(self, item):
+        with self._lock:
+            self._item = item
 
+    def get_latest(self):
+        with self._lock:
+            item = self._item
+            self._item = None
+            return item
 
-    # ========================================================
-    # LOAD YOLO
-    # ========================================================
-
-    print("[1/4] Loading YOLO11n...")
-
-    yolo = YOLO(
-        YOLO_MODEL
-    )
-
-    print("[YOLO] Model loaded")
-    print("[YOLO] Device: CPU")
+    def clear(self):
+        with self._lock:
+            self._item = None
 
 
-    # ========================================================
-    # LOAD HMR
-    # ========================================================
+# ============================================================
+# HMR WORKER
+# ============================================================
 
-    print()
-    print("[2/4] Loading HMR2...")
+class BackgroundHMR:
+    """
+    Background HMR processor.
 
-    hmr = HMRProcessor()
+    Only one HMR inference runs at a time.
+    A newer frame replaces any older waiting frame.
+    """
 
-    print("[HMR] Model loaded")
-    print("[HMR] Device: CPU")
+    def __init__(self, output_callback):
+        self.output_callback = output_callback
 
+        self.queue = LatestHMRQueue()
 
-    # ========================================================
-    # CREATE SYNCHRONIZER
-    # ========================================================
+        self.running = False
+        self.thread = None
 
-    print()
-    print("[3/4] Creating synchronizer...")
+        self.processor = None
 
-    synchronizer = FrameSynchronizer(
-        max_buffer_size=30,
-        max_time_difference=MAX_SYNC_TIME
-    )
+        self.processed_frames = 0
+        self.start_time = None
 
-    print("[SYNC] Synchronizer ready")
+    def start(self):
+        print("[HMR BG] Starting...")
+        print("[HMR BG] Loading HMR2...")
 
+        self.processor = HMRProcessor()
 
-    # ========================================================
-    # OPEN CAMERA
-    # ========================================================
+        print("[HMR BG] HMR2 loaded")
+        print("[HMR BG] Device: CPU")
 
-    print()
-    print("[4/4] Opening camera...")
+        self.running = True
+        self.start_time = time.time()
 
-    cap = cv2.VideoCapture(
-        CAMERA,
-        cv2.CAP_V4L2
-    )
-
-    if not cap.isOpened():
-
-        raise RuntimeError(
-            f"Could not open camera: {CAMERA}"
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
         )
 
+        self.thread.start()
 
-    # Force MJPEG
-    cap.set(
-        cv2.CAP_PROP_FOURCC,
-        cv2.VideoWriter_fourcc(
-            *"MJPG"
-        )
-    )
+        print("[HMR BG] Started")
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        640
-    )
+    def submit(
+        self,
+        frame,
+        frame_id,
+        timestamp,
+        boxes,
+        yolo_result,
+    ):
+        """
+        Submit newest frame for HMR.
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        480
-    )
+        The newest frame replaces the previous waiting frame.
+        """
 
-    cap.set(
-        cv2.CAP_PROP_FPS,
-        30
-    )
+        item = {
+            "frame": frame,
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "boxes": boxes,
+            "yolo_result": yolo_result,
+        }
 
+        self.queue.put_latest(item)
 
-    width = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_WIDTH
-        )
-    )
+    def _run(self):
+        while self.running:
 
-    height = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_HEIGHT
-        )
-    )
+            item = self.queue.get_latest()
 
-    fps = cap.get(
-        cv2.CAP_PROP_FPS
-    )
-
-
-    print(
-        f"[CAMERA] {width}x{height} @ {fps:.1f} FPS"
-    )
-
-
-    # ========================================================
-    # START
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("PIPELINE STARTED")
-    print("=" * 70)
-
-    print()
-    print(
-        f"HMR interval: every {HMR_INTERVAL} frames"
-    )
-
-    print(
-        "Press Ctrl+C to stop"
-    )
-
-    print()
-
-
-    # ========================================================
-    # VARIABLES
-    # ========================================================
-
-    frame_id = 0
-
-    total_frames = 0
-
-    yolo_frames = 0
-
-    hmr_frames = 0
-
-    fused_frames = 0
-
-
-    # ========================================================
-    # MAIN LOOP
-    # ========================================================
-
-    try:
-
-        while True:
-
-            # ------------------------------------------------
-            # Capture frame
-            # ------------------------------------------------
-
-            ret, frame = cap.read()
-
-            if not ret:
-
-                print(
-                    "[CAMERA] Failed to read frame"
-                )
-
+            if item is None:
+                time.sleep(0.01)
                 continue
 
+            frame = item["frame"]
+            frame_id = item["frame_id"]
+            timestamp = item["timestamp"]
+            boxes = item["boxes"]
+            yolo_result = item["yolo_result"]
 
-            timestamp = time.time()
-
-            total_frames += 1
-
-
-            # =================================================
-            # YOLO
-            # =================================================
-
-            yolo_results = yolo(
-                frame,
-                device="cpu",
-                classes=[0],
-                conf=YOLO_CONFIDENCE,
-                verbose=False
-            )
-
-
-            persons = []
-
-
-            for result in yolo_results:
-
-                if result.boxes is None:
-                    continue
-
-
-                for i, box in enumerate(
-                    result.boxes
-                ):
-
-                    confidence = float(
-                        box.conf[0]
-                    )
-
-
-                    x1, y1, x2, y2 = (
-                        box.xyxy[0].tolist()
-                    )
-
-
-                    persons.append({
-
-                        "person_id": i,
-
-                        "confidence": confidence,
-
-                        "bbox": {
-
-                            "x1": int(x1),
-                            "y1": int(y1),
-                            "x2": int(x2),
-                            "y2": int(y2)
-                        }
-
-                    })
-
-
-            # ------------------------------------------------
-            # Create YOLO JSON
-            # ------------------------------------------------
-
-            yolo_data = {
-
-                "frame_id": frame_id,
-
-                "timestamp": timestamp,
-
-                "model": "YOLO11n",
-
-                "device": "cpu",
-
-                "image": {
-
-                    "width": width,
-
-                    "height": height
-                },
-
-                "persons": persons
-            }
-
-
-            yolo_frames += 1
-
-
-            print(
-                f"[YOLO] Frame {frame_id}: "
-                f"{len(persons)} person(s)"
-            )
-
-
-            # ------------------------------------------------
-            # Add YOLO to synchronizer
-            # ------------------------------------------------
-
-            fused = synchronizer.add_yolo(
-                yolo_data
-            )
-
-
-            if fused is not None:
-
-                save_fused_frame(
-                    fused
+            try:
+                print(
+                    f"[HMR BG] Processing frame "
+                    f"{frame_id} | persons={len(boxes)}"
                 )
 
-                fused_frames += 1
+                start = time.time()
 
+                result = self.processor.process_frame(
+                    frame=frame,
+                    frame_id=frame_id,
+                    timestamp=timestamp,
+                    boxes=boxes,
+                )
 
-            # =================================================
-            # HMR
-            # =================================================
+                elapsed = time.time() - start
 
-            if (
-                frame_id % HMR_INTERVAL == 0
-                and len(persons) > 0
-            ):
+                self.processed_frames += 1
 
                 print(
-                    f"[HMR] Processing frame "
-                    f"{frame_id}..."
+                    f"[HMR BG] Frame {frame_id} completed | "
+                    f"time={elapsed:.2f}s | "
+                    f"persons={len(result.get('persons', []))}"
                 )
 
+                # Send result back to main pipeline.
+                self.output_callback(
+                    yolo_result,
+                    result,
+                )
 
-                start_hmr = time.time()
+            except Exception as e:
+                print(
+                    f"[HMR BG] Error on frame "
+                    f"{frame_id}: {type(e).__name__}: {e}"
+                )
+
+    def stop(self):
+        print("[HMR BG] Stopping...")
+
+        self.running = False
+        self.queue.clear()
+
+        if self.thread is not None:
+            self.thread.join(timeout=30)
+
+        elapsed = (
+            time.time() - self.start_time
+            if self.start_time is not None
+            else 0
+        )
+
+        fps = (
+            self.processed_frames / elapsed
+            if elapsed > 0
+            else 0
+        )
+
+        print(
+            f"[HMR BG] Processed: "
+            f"{self.processed_frames} frames"
+        )
+
+        print(
+            f"[HMR BG] Average FPS: "
+            f"{fps:.4f}"
+        )
+
+        print("[HMR BG] Stopped")
 
 
-                # Convert YOLO boxes
-                # into HMR format
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+class BASLivePipeline:
+
+    def __init__(self):
+
+        self.camera = None
+        self.yolo = None
+        self.hmr = None
+        self.synchronizer = None
+
+        self.running = False
+
+        self.total_frames = 0
+        self.yolo_frames = 0
+        self.hmr_submitted = 0
+        self.fused_frames = 0
+
+    # --------------------------------------------------------
+    # HMR RESULT CALLBACK
+    # --------------------------------------------------------
+
+    def handle_hmr_result(
+        self,
+        yolo_result,
+        hmr_result,
+    ):
+        """
+        Called automatically when HMR finishes.
+        """
+
+        fused = self.synchronizer.add_yolo(
+            yolo_result
+        )
+
+        if fused is None:
+            fused = self.synchronizer.add_hmr(
+                hmr_result
+            )
+
+        if fused is None:
+            return
+
+        self.fused_frames += 1
+
+        frame_id = fused["frame_id"]
+
+        print()
+        print(
+            f"[FUSED] Frame {frame_id} synchronized"
+        )
+
+        print(
+            f"[FUSED] YOLO persons: "
+            f"{len(fused['yolo']['persons'])}"
+        )
+
+        print(
+            f"[FUSED] HMR persons: "
+            f"{len(fused['hmr']['persons'])}"
+        )
+
+        print(
+            f"[FUSED] Timestamp difference: "
+            f"{fused['synchronization']['timestamp_difference']:.6f}s"
+        )
+
+        if SAVE_FUSED_JSON:
+            output_path = os.path.join(
+                OUTPUT_DIR,
+                f"frame_{frame_id:06d}_fused.json",
+            )
+
+            try:
+                with open(
+                    output_path,
+                    "w",
+                ) as f:
+
+                    json.dump(
+                        fused,
+                        f,
+                        indent=2,
+                    )
+
+                print(
+                    f"[FUSED] Saved: {output_path}"
+                )
+
+            except Exception as e:
+                print(
+                    f"[FUSED] JSON save error: {e}"
+                )
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    def start(self):
+
+        print()
+        print("=" * 70)
+        print("           BAS CPU-SAFE LIVE PIPELINE")
+        print("=" * 70)
+        print()
+
+        os.makedirs(
+            OUTPUT_DIR,
+            exist_ok=True,
+        )
+
+        # ----------------------------------------------------
+        # Camera
+        # ----------------------------------------------------
+
+        print("[1/4] Starting camera...")
+
+        self.camera = CameraWorker(
+            camera=CAMERA,
+            width=640,
+            height=480,
+            fps=30,
+        )
+
+        self.camera.start()
+
+        # ----------------------------------------------------
+        # YOLO
+        # ----------------------------------------------------
+
+        print()
+        print("[2/4] Loading YOLO...")
+
+        self.yolo = YOLOProcessor(
+            model_path=YOLO_MODEL,
+            device="cpu",
+        )
+
+        print("[YOLO] Ready")
+
+        # ----------------------------------------------------
+        # Synchronizer
+        # ----------------------------------------------------
+
+        print()
+        print("[3/4] Creating synchronizer...")
+
+        self.synchronizer = FrameSynchronizer(
+            max_buffer_size=30,
+            max_time_difference=MAX_SYNC_TIME,
+        )
+
+        print("[SYNC] Ready")
+
+        # ----------------------------------------------------
+        # HMR
+        # ----------------------------------------------------
+
+        print()
+        print("[4/4] Starting background HMR...")
+
+        self.hmr = BackgroundHMR(
+            output_callback=self.handle_hmr_result,
+        )
+
+        self.hmr.start()
+
+        self.running = True
+
+        print()
+        print("=" * 70)
+        print("PIPELINE STARTED")
+        print("=" * 70)
+
+        print()
+        print("Architecture:")
+        print("Camera -> YOLO -> Latest HMR -> Synchronizer")
+        print()
+        print("HMR queue size: 1")
+        print("Old waiting frames are discarded.")
+        print("Press Ctrl+C to stop.")
+        print()
+
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
+    def run(self):
+
+        self.start()
+
+        last_status_time = time.time()
+
+        try:
+
+            while self.running:
+
+                # ------------------------------------------------
+                # CAPTURE FRAME
+                # ------------------------------------------------
+
+                item = self.camera.read()
+
+                if item is None:
+                    continue
+
+                frame = item["frame"]
+                frame_id = item["frame_id"]
+                timestamp = item["timestamp"]
+
+                self.total_frames += 1
+
+                # ------------------------------------------------
+                # YOLO
+                # ------------------------------------------------
+
+                yolo_result = self.yolo.process_frame(
+                    frame=frame,
+                    frame_id=frame_id,
+                    timestamp=timestamp,
+                )
+
+                self.yolo_frames += 1
+
+                persons = yolo_result.get(
+                    "persons",
+                    [],
+                )
+
+                # ------------------------------------------------
+                # NO PERSON
+                # ------------------------------------------------
+
+                if len(persons) == 0:
+
+                    # Nothing useful to send to HMR.
+                    continue
+
+                # ------------------------------------------------
+                # CREATE HMR BOXES
+                # ------------------------------------------------
 
                 boxes = []
-
 
                 for person in persons:
 
                     bbox = person["bbox"]
 
                     boxes.append([
-
                         bbox["x1"],
                         bbox["y1"],
                         bbox["x2"],
-                        bbox["y2"]
-
+                        bbox["y2"],
                     ])
 
+                # ------------------------------------------------
+                # SUBMIT NEWEST FRAME TO HMR
+                # ------------------------------------------------
 
-                try:
+                self.hmr.submit(
+                    frame=frame,
+                    frame_id=frame_id,
+                    timestamp=timestamp,
+                    boxes=np.asarray(
+                        boxes,
+                        dtype=np.float32,
+                    ),
+                    yolo_result=yolo_result,
+                )
 
-                    hmr_data = hmr.process_frame(
+                self.hmr_submitted += 1
 
-                        frame=frame,
+                # ------------------------------------------------
+                # STATUS
+                # ------------------------------------------------
 
-                        frame_id=frame_id,
+                now = time.time()
 
-                        timestamp=timestamp,
+                if now - last_status_time >= 5:
 
-                        boxes=boxes
-
+                    print()
+                    print(
+                        "[STATUS]"
                     )
-
-
-                    hmr_frames += 1
-
-
-                    elapsed = (
-                        time.time()
-                        - start_hmr
-                    )
-
 
                     print(
-                        f"[HMR] Frame {frame_id} "
-                        f"completed in "
-                        f"{elapsed:.2f}s"
+                        f"Camera frames : "
+                        f"{self.total_frames}"
                     )
-
 
                     print(
-                        f"[HMR] Persons: "
-                        f"{len(hmr_data['persons'])}"
+                        f"YOLO frames   : "
+                        f"{self.yolo_frames}"
                     )
-
-
-                    # ----------------------------------------
-                    # Add HMR to synchronizer
-                    # ----------------------------------------
-
-                    fused = (
-                        synchronizer.add_hmr(
-                            hmr_data
-                        )
-                    )
-
-
-                    # ----------------------------------------
-                    # FUSED RESULT
-                    # ----------------------------------------
-
-                    if fused is not None:
-
-                        fused_frames += 1
-
-                        print()
-                        print(
-                            "******** FUSED FRAME ********"
-                        )
-
-                        print(
-                            f"Frame ID: "
-                            f"{fused['frame_id']}"
-                        )
-
-                        print(
-                            f"YOLO persons: "
-                            f"{len(fused['yolo']['persons'])}"
-                        )
-
-                        print(
-                            f"HMR persons: "
-                            f"{len(fused['hmr']['persons'])}"
-                        )
-
-                        print(
-                            f"Time difference: "
-                            f"{fused['synchronization']['timestamp_difference']:.4f}s"
-                        )
-
-                        print(
-                            "*******************************"
-                        )
-
-                        print()
-
-
-                        save_fused_frame(
-                            fused
-                        )
-
-
-                except Exception as e:
 
                     print(
-                        f"[HMR ERROR] "
-                        f"Frame {frame_id}: {e}"
+                        f"HMR submitted : "
+                        f"{self.hmr_submitted}"
                     )
 
+                    print(
+                        f"Fused frames  : "
+                        f"{self.fused_frames}"
+                    )
 
-            frame_id += 1
+                    last_status_time = now
 
+        except KeyboardInterrupt:
 
-    except KeyboardInterrupt:
+            print()
+            print("[SYSTEM] Ctrl+C received")
+
+        finally:
+
+            self.stop()
+
+    # --------------------------------------------------------
+    # STOP
+    # --------------------------------------------------------
+
+    def stop(self):
+
+        if not self.running:
+            return
+
+        self.running = False
 
         print()
+        print("=" * 70)
+        print("STOPPING PIPELINE")
+        print("=" * 70)
+
+        # ----------------------------------------------------
+        # HMR
+        # ----------------------------------------------------
+
+        if self.hmr is not None:
+
+            try:
+                self.hmr.stop()
+            except Exception as e:
+                print(
+                    f"[HMR] Stop warning: {e}"
+                )
+
+        # ----------------------------------------------------
+        # Camera
+        # ----------------------------------------------------
+
+        if self.camera is not None:
+
+            try:
+                self.camera.stop()
+            except Exception as e:
+                print(
+                    f"[CAMERA] Stop warning: {e}"
+                )
+
+        # ----------------------------------------------------
+        # Statistics
+        # ----------------------------------------------------
+
         print()
+        print("=" * 70)
+        print("PIPELINE STATISTICS")
+        print("=" * 70)
+
+        print(
+            f"Camera frames captured : "
+            f"{self.total_frames}"
+        )
+
+        print(
+            f"YOLO frames processed  : "
+            f"{self.yolo_frames}"
+        )
+
+        print(
+            f"HMR frames submitted   : "
+            f"{self.hmr_submitted}"
+        )
+
+        print(
+            f"Fused frames           : "
+            f"{self.fused_frames}"
+        )
+
         print("=" * 70)
         print("PIPELINE STOPPED")
         print("=" * 70)
-
-
-    finally:
-
-        cap.release()
-
-
-        print()
-        print(
-            f"Total camera frames : {total_frames}"
-        )
-
-        print(
-            f"YOLO frames         : {yolo_frames}"
-        )
-
-        print(
-            f"HMR frames          : {hmr_frames}"
-        )
-
-        print(
-            f"Fused frames        : {fused_frames}"
-        )
-
-        print()
-
-
-# ============================================================
-# SAVE FUSED FRAME
-# ============================================================
-
-def save_fused_frame(data):
-
-    frame_id = data["frame_id"]
-
-    filename = (
-        f"live_fused_"
-        f"{frame_id:06d}.json"
-    )
-
-    path = os.path.join(
-        OUTPUT_DIR,
-        filename
-    )
-
-
-    with open(
-        path,
-        "w"
-    ) as f:
-
-        json.dump(
-            data,
-            f,
-            indent=4
-        )
-
-
-    print(
-        f"[FUSED] Saved: {filename}"
-    )
 
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
 
-if __name__ == "__main__":
+def main():
 
+    pipeline = BASLivePipeline()
+
+    pipeline.run()
+
+
+if __name__ == "__main__":
     main()

@@ -1,44 +1,64 @@
-from camera_worker import CameraWorker
+import time
+
+from pipeline.camera_worker import CameraWorker
 
 
 def main():
 
-    camera = CameraWorker()
+    print("=" * 60)
+    print("CAMERA WORKER TEST")
+    print("=" * 60)
 
-    camera.start()
+    camera = CameraWorker(
+        camera="/dev/video0",
+        width=640,
+        height=480,
+        fps=30,
+    )
 
-    print("[TEST] Reading 10 frames...")
+    try:
 
+        camera.start()
 
-    for frame_id in range(10):
+        print()
+        print("[TEST] Camera started")
+        print("[TEST] Capturing for 10 seconds...")
+        print()
 
-        data = camera.read()
+        start = time.time()
 
-        if data is None:
+        while time.time() - start < 10:
+
+            data = camera.read()
+
+            if data is None:
+                continue
 
             print(
-                "[TEST] Failed to read frame"
+                f"[FRAME] "
+                f"id={data['frame_id']} | "
+                f"time={data['timestamp']:.3f} | "
+                f"shape={data['frame'].shape}"
             )
 
-            continue
+    except KeyboardInterrupt:
 
+        print()
+        print("[TEST] Interrupted by user")
 
-        data["frame_id"] = frame_id
+    except Exception as e:
 
+        print()
+        print(f"[TEST] ERROR: {e}")
 
-        frame = data["frame"]
+    finally:
 
+        camera.stop()
 
-        print(
-            f"[TEST] Frame {frame_id} "
-            f"| shape={frame.shape} "
-            f"| timestamp={data['timestamp']}"
-        )
-
-
-    camera.stop()
-
-    print("[TEST] Camera worker OK")
+    print()
+    print("=" * 60)
+    print("CAMERA WORKER TEST COMPLETE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
