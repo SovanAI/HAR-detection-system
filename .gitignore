@@ -41,3 +41,51 @@ Thumbs.db
 output/
 input/
 models/
+runs/
+
+# Trained models and weights
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.weights
+*.pkl
+*.pickle
+*.model
+*.bin
+checkpoints/
+
+# Datasets and training images
+datasets/
+data/
+
+# Image formats
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+*.svg
+
+# Video formats
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+
+# Large data files
+*.zip
+*.tar
+*.gz
+*.tar.gz
+*.rar
+*.7z
+
+# Numpy and data arrays
+*.npy
+*.npz
