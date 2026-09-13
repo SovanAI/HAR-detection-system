@@ -89,3 +89,6 @@ data/
 # Numpy and data arrays
 *.npy
 *.npz
+
+# JSON files
+*.json

@@ -1,5 +1,26 @@
+"""
+BAS Human Feature Analyzer
+
+Pipeline:
+
+BAS fused frame
+    ↓
+Human State
+    ↓
+Motion
+    ↓
+Posture
+    ↓
+Unified Human Features
+
+This module does NOT classify activities.
+HAR classification is handled separately by HAREngine.
+"""
+
+from __future__ import annotations
+
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from human.state_extractor import HumanStateExtractor
 from human.motion_analyzer import MotionAnalyzer
@@ -8,28 +29,64 @@ from human.posture_analyzer import PostureAnalyzer
 
 class HumanFeatureAnalyzer:
     """
-    Combines human state, motion, and posture into one
-    feature representation for the future HAR engine.
-
-    This module does not classify activities yet.
+    Combines human state, motion, posture, and hand information
+    into a single temporal feature representation.
     """
 
     def __init__(self):
+
         self.state_extractor = HumanStateExtractor()
+
         self.motion_analyzer = MotionAnalyzer()
+
         self.posture_analyzer = PostureAnalyzer()
+
+    # ----------------------------------------------------------
+    # Find hands belonging to a person
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _get_person_hands(
+        fused_data: Dict[str, Any],
+        person_id: int,
+    ):
+
+        persons = fused_data.get(
+            "persons",
+            [],
+        )
+
+        for person in persons:
+
+            if int(
+                person.get("person_id", -1)
+            ) == int(person_id):
+
+                return person.get(
+                    "hands",
+                    [],
+                )
+
+        return []
+
+    # ----------------------------------------------------------
+    # Process one frame
+    # ----------------------------------------------------------
 
     def process_frame(
         self,
         fused_data: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Process one fused YOLO + HMR frame.
+        Process one canonical BAS fused frame.
+
+        Returns a feature frame suitable for the
+        TemporalFeatureBuffer and HAREngine.
         """
 
-        # ----------------------------------------------------
-        # HUMAN STATE
-        # ----------------------------------------------------
+        # ======================================================
+        # 1. HUMAN STATE
+        # ======================================================
 
         human_state = (
             self.state_extractor.extract_from_fused(
@@ -37,33 +94,31 @@ class HumanFeatureAnalyzer:
             )
         )
 
-        # ----------------------------------------------------
-        # MOTION
-        # ----------------------------------------------------
+        # ======================================================
+        # 2. MOTION
+        # ======================================================
 
         motion = self.motion_analyzer.analyze(
             human_state
         )
 
-        # ----------------------------------------------------
-        # POSTURE
-        # ----------------------------------------------------
+        # ======================================================
+        # 3. POSTURE
+        # ======================================================
 
         posture = self.posture_analyzer.analyze(
             human_state
         )
 
-        # ----------------------------------------------------
-        # COMBINE
-        # ----------------------------------------------------
-
-        persons = []
+        # ======================================================
+        # 4. INDEX RESULTS BY PERSON ID
+        # ======================================================
 
         motion_persons = {
             int(person["person_id"]): person
             for person in motion.get(
                 "persons",
-                []
+                [],
             )
         }
 
@@ -71,13 +126,19 @@ class HumanFeatureAnalyzer:
             int(person["person_id"]): person
             for person in posture.get(
                 "persons",
-                []
+                [],
             )
         }
 
+        # ======================================================
+        # 5. COMBINE
+        # ======================================================
+
+        persons = []
+
         for person in human_state.get(
             "persons",
-            []
+            [],
         ):
 
             person_id = int(
@@ -86,51 +147,84 @@ class HumanFeatureAnalyzer:
 
             motion_data = motion_persons.get(
                 person_id,
-                {}
+                {},
             )
 
             posture_data = posture_persons.get(
                 person_id,
-                {}
+                {},
             )
 
-            persons.append({
-                "person_id": person_id,
+            # --------------------------------------------------
+            # Hand information
+            # --------------------------------------------------
 
-                "detection": person.get(
-                    "detection",
-                    {}
+            hands = self._get_person_hands(
+                fused_data,
+                person_id,
+            )
+
+            # --------------------------------------------------
+            # Detection
+            # --------------------------------------------------
+
+            detection = person.get(
+                "detection",
+                {},
+            )
+
+            # --------------------------------------------------
+            # Position
+            # --------------------------------------------------
+
+            joints = person.get(
+                "joints_3d",
+                {},
+            )
+
+            position = {
+                "camera_translation": person.get(
+                    "camera_translation",
+                    {},
                 ),
+                "pelvis": joints.get(
+                    "pelvis"
+                ),
+            }
 
-                "position": {
-                    "camera_translation": person.get(
-                        "camera_translation",
-                        {}
+            # --------------------------------------------------
+            # Final person feature representation
+            # --------------------------------------------------
+
+            persons.append(
+                {
+                    "person_id": person_id,
+
+                    "detection": detection,
+
+                    "position": position,
+
+                    "motion": motion_data.get(
+                        "motion",
+                        {},
                     ),
 
-                    "pelvis": person.get(
-                        "joints_3d",
-                        {}
-                    ).get(
-                        "pelvis"
-                    )
-                },
+                    "posture": posture_data.get(
+                        "posture",
+                        {},
+                    ),
 
-                "motion": motion_data.get(
-                    "motion",
-                    {}
-                ),
+                    "joints_3d": joints,
 
-                "posture": posture_data.get(
-                    "posture",
-                    {}
-                ),
+                    "hands": hands,
 
-                "joints_3d": person.get(
-                    "joints_3d",
-                    {}
-                ),
-            })
+                    "hand_count": len(hands),
+                }
+            )
+
+        # ======================================================
+        # 6. FRAME OUTPUT
+        # ======================================================
 
         return {
             "frame_id": int(
@@ -144,8 +238,25 @@ class HumanFeatureAnalyzer:
             "model": "HumanFeatureAnalyzer",
 
             "persons": persons,
+
+            "metadata": {
+                "feature_version": "1.1",
+
+                "features": [
+                    "detection",
+                    "position",
+                    "joints_3d",
+                    "motion",
+                    "posture",
+                    "hands",
+                ],
+            },
         }
 
+
+# ==============================================================
+# FILE HELPERS
+# ==============================================================
 
 def load_fused_file(
     path: str,
@@ -157,7 +268,9 @@ def load_fused_file(
     with open(
         path,
         "r",
+        encoding="utf-8",
     ) as f:
+
         return json.load(f)
 
 
@@ -172,7 +285,9 @@ def save_features(
     with open(
         path,
         "w",
+        encoding="utf-8",
     ) as f:
+
         json.dump(
             features,
             f,
